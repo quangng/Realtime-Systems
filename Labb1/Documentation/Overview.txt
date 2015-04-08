@@ -1,0 +1,247 @@
+Beagle Board Phaser App Version 1
+=================================
+
+Overview
+--------
+
+This program implements an flanger effect using a BeagleBoard with an
+attached LCD touchscreen and rotary encoder knobs. The BeagleBoard's
+internal AD and DA converters are used to input and output audio signals
+while the screen and encoders are used to run the user interface.
+
+
+
+Main program structure
+----------------------
+
+The main program lives in the file `Main.c`.
+
+The program is implemented as a simple loop that is clocked by the
+audio sampling clock. The program reads a set number of samples from
+the audio hardware (specifically, 16 samples at 44.1kHz), then performs
+the interface tasks and processes the audio, and finally outputs the
+same number of samples. The audio hardware uses a larger buffer to
+store samples that are being read and written, and if the loop finishes
+faster than the buffers fill up or empty, the reading and writing
+functions block until enough buffered data or buffer space is available.
+
+More specifically, the main loop performs the following tasks:
+
+* Read two times 16 samples from the audio hardware into an input
+  sample buffer. The left and right channels arrive as separate
+  interleaved sample values, thus double the number of samples is read
+  to get a full stereo data stream. If 32 sample values are not
+  available in the buffer, the reading function waits until they become
+  available.
+
+* Read the pen position and pressure from the touch screen. If the
+  pen is pressed to the screen, then depending on the position of the
+  pen, the program might:
+
+  * Update the duration parameter for the flanger effect.
+  * Update the mixing parameter for the flanger effect.
+  * Update the feedback parameter for the flanger effect.
+
+  If one of these occurred, and the value of the parameter was changed,
+  the program will set a flag that the screen needs to be updated.
+
+* Read the change in position for the rotary encoders. If any of the
+  encoders' positions have changed, the parameter that encoder controls
+  is updated. The paramters are the same as the ones mentioned above.
+
+  In this case, the update flag for the screen will also be set if one
+  of the parameters has been changed.
+
+* If the update flag mentioned in the previous two points has been set,
+  the program re-draws the bars shown on the screen using an off-screen
+  buffer, and then transfers the entire screen to the display.
+
+* A counter for the LFO that controls the delay of the phaser effect is
+  increased, and if it exceeds the maximum value (as determined by the
+  duration setting), the LFO is updated and the phaser effect's delay is
+  set to a new value.
+
+* The audio is then processed. The following steps are performed twice,
+  once for each interleaved channel in the input buffer:
+
+  * Copy the samples for one channel from the input buffer to a
+    temporary buffer.
+  * Run the flanger effect on this temporary buffer, storing the result
+    in another temporary buffer.
+  * Copy the samples from the second temporary buffer to the ouput
+    buffer.
+
+* Finally, the output buffer is written to the audio hardware. If there
+  is not enough space to store the 32 output samples, the writing
+  function will block until there is enough space. (This likely never
+  happens, as the delay while reading will synchronize the writing so
+  that space is always available.)
+
+
+
+Problem
+-------
+
+As the main loop reads 16 stereo samples at a time, one run takes
+16/44100 seconds, or 363 microseconds. A screen update takes
+significantly longer than this, so every time the update step is
+triggered in the loop, the loop will run for too long, and samples will
+be dropped. This introduces very audible distortions into the output
+audio, especially when using the touchscreen, as this causes a large
+number of screen updates to happen.
+
+As the program runs directly on the processor with no multitasking
+operating system present, the update process will need to be manually
+split into multiple sections, run over several iterations of the main
+loop.
+
+
+
+Program Modules
+---------------
+
+### Phaser effect module
+
+The phaser effect module consists of the files `Phaser.c` and
+`Phaser.h`. It implements the phaser effect itself using a circular
+buffer that stores the delayed samples. It creates its output by mixing
+the delayed signal with the input signal, and saves the input signal in
+the delay buffer. It can also mix the old delayed signal into the new
+delayed signal as feedback.
+
+It provides functions to run the effect on a sample buffer, writing the
+result to a new sample buffer, and functions for adjusting the
+parameters (the delay, mixing and feedback).
+
+### LFO module
+
+The LFO module consists of the files `LFO.c` and `LFO.h`. It implements
+a simple triangular LFO (low-frequency oscillator). It outputs a signal
+that varies between a positive and a negative maximum amplitude in a
+linear fashion, with a given period.
+
+There is a function initialize the LFO with given paramters, and a
+function to read the next value from the LFO's triangle-wave output.
+
+
+
+High-level Hardware Driver Modules
+----------------------------------
+
+### Audio module
+
+The audio module consists of the files `Audio.c` and `Audio.h`. It
+implements functions for reading and writing to the audio hardware, and
+for checking its status.
+
+The audio hardware uses an internal buffer to store incoming and
+outgoing samples. When writing, data will be quickly copied to the
+buffer if space is available, otherwise the function blocks until enough
+space becomes available.
+
+Reading is similarly fast when data is available in the buffer. There
+are both blocking and non-blocking functions for reading. The blocking
+ones wait when not enough data is available in the buffer to read, while
+the non-blocking ones only return as much data as is available.
+
+### Display and touchscreen module
+
+The display and touchscreen module consists of the files
+`DisplayDOGM128.c` and `DisplayDOGM128.h`. It implements functions for
+sending data to the display, and for polling the touchscreen position
+and pressure, and also functions for calibrating the touchscreen.
+
+The display controller and touchscreen controller share an SPI bus, and
+can therefore traffic to one has to finish before the other can be
+accessed. The module implements this by having all functions block until
+transfers complete.
+
+The display is represented as a eight rows that are 8 pixels high and
+128 pixels wide. Each column of 8 pixels is stored as a single byte,
+where each bit represents a pixel. The row then consists of 128 bytes
+for each 8-pixel column in the row, from left to right.
+
+To update the screen, you pick a starting row and the horizontal
+position in the row, and then send a number of bytes representing the
+pixels. There is a function that updates the whole screen by sending
+128 bytes for each row from top to bottom, for a total of 1024 bytes,
+but it is also possible to manually address a specific position on the
+screen and send a smaller portion of the display data.
+
+The touchscreen returns uncalibrated values from several AD converters.
+To convert these to screen positions, calibration is needed. There are
+functions available to perform a calibration, and to use the calibration
+data to convert the data read from the touchscreen.
+
+### Rotary encoder module
+
+The rotary encoder module consists of the files `Encoders.c` and
+`Encoders.h`. It implements functions for reading the state of the
+rotary encoders on the front panel.
+
+The rotary encoders are implemented through an interrupt handler that is
+triggered whenever an encoder is moved. The interrupt handler updates an
+internal state in the library, which can be polled through the functions
+provided by the library.
+
+
+
+Low-level Modules
+-----------------
+
+### LED module
+
+The LED module conists of the files `LED.c` and `LED.h`. It provides
+functions to set the state of the LEDs on the Beagle Board. It can be
+useful for debugging.
+
+### Serial module
+
+The serial module conists of the files `Serial.c` and `Serial.h`. It
+provides functions to read and write to the onboard serial port. If a
+serial cable is connected to the board, this can be used for debugging.
+(It does not support emulating a serial port over the USB connection,
+however).
+
+### Interrupt handler module
+
+The interrupt handler module consists of the files `Interrupts.c`,
+`Interrupts.h` and `InterruptHandler.S`. It takes care of routing
+interrupts to interrupt handlers. It is used internally by the rotary
+encoder module.
+
+### I2C module
+
+The I2C module consists of the files `I2C.c` and `I2C.h`. It implements
+functions for using the processor's I2C bus, which is used to talk to
+the audio codec. It is used internally by the audio module.
+
+### Hardware definition headers
+
+The hardware definitions headers are the files `Register.h` and
+`GPIO.h`. They provide macros for accessing the hardware registers. They
+are used internally by most of the driver modules.
+
+### Startup code
+
+The startup code lives in the file `Start.S`. It is executed first of
+all, and takes care of intializing the runtime environment, and calling
+the `main()` function of the program.
+
+
+
+Test application
+----------------
+
+The files `Test.c`, `CT2.c` and `CT2.h` implement a hardware test
+application. This can be used to verify that the hardware works as it
+should. It makes use of the audio output and input, the screen, the
+touch screen controller, and the rotary encoders. All inputs are shown
+on the screen, while all outputs are fed some kind of signal that should
+be visible or audiable.
+
+To compile and upload the test application, run `make test` on the
+command line.
+
+
+
